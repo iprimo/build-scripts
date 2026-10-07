@@ -15,7 +15,12 @@ Docker status, SSH keys) then shows a menu:
 4. Install essential networking tools (net-tools, dnsutils, tcpdump, nmap, etc.)
 5. Install Docker & Docker Compose (official convenience script)
 6. Add an SSH public key (to the invoking user's account and root)
-7. Set up insecure Docker registries (`/etc/docker/daemon.json`)
+7. Generate a local SSH key pair (ed25519 or rsa)
+8. Print SSH public key(s) to the screen
+9. Set up insecure Docker registries (`/etc/docker/daemon.json`)
+10. Deploy a Woodpecker CI agent container — asks for environment
+    (Development/Test/Production) and folds it into the agent hostname
+    (e.g. `dev-`, `test-`, `prd-` prefix)
 
 Must be run as root (`sudo`). Netplan edits are backed up before being changed.
 
