@@ -455,11 +455,16 @@ install_docker() {
 # 6) Add SSH public key
 # ---------------------------------------------------------------------------
 
+DEFAULT_SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCmTqkJi1LAzECQc0e1hB/raIjwjyCpEFTxS3Ira8uR72iTRJwZvBG9O6GIXu3gtUwBRvUdIFrzBCyL0fGb+7qIMsoczq/4WQoberX2TXh7EQHgSHQtV7p2zmfuVwrQxxzW27znutHmC0muZ23U8Bb4WB+5kmIS7xGYO52CN+RK0lnmjhx1X9DVmnwF4v/xfBAmYSmV7lr2meDg6Lzuw0k+Bm8z/PUd1d6XXAzkqru0+e/lBfePRl7tnGRh3Hj482pUKWijUa4jzTNX3/YqgQy9KLnBQao28a9iWJSWnlnNhOUzKAU58Re4/PK9gtYIgPWmagqZiEAfsJ+hQTDGdxaYrUky03qDTk2LmakZUZXLjO2iAGKAEBXZEJe185tnOx3mNBESJCXNqF5rgYjODhN6kXSTNpxCujzBpxXaBd5xKRavbep4DuPEvOHrdKeVkwddmru6VKRgMPlGtuSpTJKu9/NDUdIWsAd30qGcy4XBe1GFPPoejjFwKEt37ko3LtE= Ali-HP-Laptop-Public-Key"
+
 add_ssh_key() {
     clear
     echo -e "${YELLOW}--- Add SSH public key ---${NC}"
-    echo "Paste the public key (single line, e.g. 'ssh-ed25519 AAAA... comment'):"
+    echo "Default key: ${DEFAULT_SSH_KEY##* } (${DEFAULT_SSH_KEY:0:40}...)"
+    echo "Press Enter to use the default key, or paste a different public key"
+    echo "(single line, e.g. 'ssh-ed25519 AAAA... comment'):"
     read -r pubkey
+    pubkey=${pubkey:-$DEFAULT_SSH_KEY}
 
     if [[ -z "$pubkey" ]]; then
         echo -e "${RED}No key provided. Aborting.${NC}"
@@ -505,7 +510,55 @@ add_ssh_key() {
         chown -R "${owner}:${owner}" "${dir}/.ssh"
     done
 
+    allow_root_key_login
     press_enter
+}
+
+# Make sure sshd lets root in with a key (and never with a password)
+allow_root_key_login() {
+    echo
+    local current
+    current=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')
+    if [[ "$current" == "prohibit-password" || "$current" == "without-password" ]]; then
+        echo "sshd already allows root login with a key only (PermitRootLogin ${current})."
+        return
+    fi
+
+    echo "sshd currently has PermitRootLogin = ${current:-unknown}."
+    read -rp "Set PermitRootLogin to 'prohibit-password' (root key login only)? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Skipped. Root key login may be refused by sshd."
+        return
+    fi
+
+    local files=(/etc/ssh/sshd_config) f changed=0 stamp
+    stamp=$(date +%s)
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+
+    for f in "${files[@]}"; do
+        if grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]' "$f"; then
+            cp -p "$f" "${f}.bak.${stamp}"
+            sed -i -E 's/^([[:space:]]*)PermitRootLogin[[:space:]].*/\1PermitRootLogin prohibit-password/I' "$f"
+            changed=1
+        fi
+    done
+
+    if [[ $changed -eq 0 ]]; then
+        cp -p /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.${stamp}"
+        echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
+    fi
+
+    if sshd -t; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+        echo -e "${GREEN}sshd updated: root can log in with a key only.${NC}"
+    else
+        echo -e "${RED}sshd config test failed. Restoring backups.${NC}"
+        for f in "${files[@]}"; do
+            [[ -f "${f}.bak.${stamp}" ]] && mv "${f}.bak.${stamp}" "$f"
+        done
+    fi
 }
 
 # ---------------------------------------------------------------------------
