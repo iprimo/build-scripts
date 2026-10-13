@@ -49,7 +49,37 @@ netplan_file() {
 }
 
 primary_iface() {
-    ip -4 route list default | awk '{print $5; exit}'
+    local iface
+    iface=$(ip -4 route list default 2>/dev/null | awk '{print $5; exit}')
+    if [[ -z "$iface" ]]; then
+        # No default route: fall back to the first non-loopback interface that is up
+        iface=$(ip -brief link show up 2>/dev/null | awk '$1 != "lo" {print $1; exit}')
+    fi
+    echo "$iface"
+}
+
+# Prompt for an interface, defaulting to the active one. Result in $iface.
+prompt_iface() {
+    local prompt=$1 def
+    def=$(primary_iface)
+    if [[ -n "$def" ]]; then
+        read -rp "$prompt [$def]: " iface
+        iface=${iface:-$def}
+    else
+        read -rp "$prompt (e.g. eth0): " iface
+    fi
+}
+
+# First usable host address of the subnet for an IP/CIDR (e.g. 192.168.1.50/24 -> 192.168.1.1)
+first_host_ip() {
+    python3 -c '
+import sys, ipaddress
+try:
+    n = ipaddress.ip_interface(sys.argv[1]).network
+    print(n.network_address + 1)
+except ValueError:
+    sys.exit(1)
+' "$1" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -134,9 +164,17 @@ modify_ip_config() {
     ip -brief addr show | sed 's/^/  /'
     echo
 
-    read -rp "Interface to configure (e.g. eth0): " iface
+    prompt_iface "Interface to configure"
     read -rp "New static IP with CIDR (e.g. 192.168.1.50/24): " ipcidr
-    read -rp "Gateway (e.g. 192.168.1.1): " gateway
+
+    local def_gw
+    def_gw=$(first_host_ip "$ipcidr")
+    if [[ -n "$def_gw" ]]; then
+        read -rp "Gateway [$def_gw]: " gateway
+        gateway=${gateway:-$def_gw}
+    else
+        read -rp "Gateway (e.g. 192.168.1.1): " gateway
+    fi
 
     if [[ -z "$iface" || -z "$ipcidr" || -z "$gateway" ]]; then
         echo -e "${RED}All fields are required. Aborting.${NC}"
@@ -205,7 +243,7 @@ modify_dns_config() {
         return
     fi
     echo "Using netplan file: $npf"
-    read -rp "Interface to apply DNS to (e.g. eth0): " iface
+    prompt_iface "Interface to apply DNS to"
     read -rp "DNS servers, comma separated (e.g. 8.8.8.8,1.1.1.1): " dns
     read -rp "DNS search domains, comma separated (e.g. xigrom.local) [xigrom.local]: " search
     search=${search:-xigrom.local}
