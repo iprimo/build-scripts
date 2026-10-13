@@ -58,6 +58,19 @@ primary_iface() {
     echo "$iface"
 }
 
+# netplan warns "permissions too open" unless every YAML is root-only (0600)
+secure_netplan() {
+    chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
+}
+
+# Back up a netplan file (root-only) and print the backup path
+backup_netplan() {
+    local bak="$1.bak.$(date +%s)"
+    cp "$1" "$bak"
+    chmod 600 "$bak"
+    echo "$bak"
+}
+
 # Prompt for an interface, defaulting to the active one. Result in $iface.
 prompt_iface() {
     local prompt=$1 def
@@ -212,18 +225,19 @@ EOF
         return
     fi
 
-    cp "$npf" "${npf}.bak.$(date +%s)"
-    echo "Backed up existing netplan file."
+    local bak
+    bak=$(backup_netplan "$npf")
+    echo "Backed up existing netplan file to $bak."
 
     printf '%s\n' "$preview" > "$npf"
 
-    chmod 600 "$npf"
+    secure_netplan
     echo "Applying netplan configuration..."
     if netplan apply; then
         echo -e "${GREEN}Network configuration applied.${NC}"
     else
         echo -e "${RED}netplan apply failed. Restoring backup.${NC}"
-        cp "${npf}.bak."* "$npf" 2>/dev/null
+        cp "$bak" "$npf" 2>/dev/null; secure_netplan
     fi
     press_enter
 }
@@ -310,16 +324,18 @@ PYEOF
         return
     fi
 
-    cp "$npf" "${npf}.bak.$(date +%s)"
+    local bak
+    bak=$(backup_netplan "$npf")
     cp "$tmpfile" "$npf"
     rm -f "$tmpfile"
+    secure_netplan
 
     echo "Applying netplan configuration..."
     if netplan apply; then
         echo -e "${GREEN}DNS configuration applied.${NC}"
     else
         echo -e "${RED}netplan apply failed. Restoring backup.${NC}"
-        cp "${npf}.bak."* "$npf" 2>/dev/null
+        cp "$bak" "$npf" 2>/dev/null; secure_netplan
     fi
     press_enter
 }
