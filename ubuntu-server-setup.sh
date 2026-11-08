@@ -7,6 +7,7 @@
 set -uo pipefail
 
 SCRIPT_VERSION="1.0.0"
+DEFAULT_REGISTRY="ci.xigrom.local:5001"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -696,7 +697,8 @@ setup_insecure_registries() {
     fi
     echo
 
-    read -rp "Registries to mark insecure, comma separated (e.g. registry.local:5000,10.0.0.5:5000): " regs
+    read -rp "Registries to mark insecure, comma separated [${DEFAULT_REGISTRY}]: " regs
+    regs=${regs:-$DEFAULT_REGISTRY}
 
     if [[ -z "$regs" ]]; then
         echo -e "${RED}No registries provided. Aborting.${NC}"
@@ -1151,16 +1153,9 @@ health_check() {
     echo -e "${YELLOW}--- CI/CD health check ---${NC}"
     HC_PASS=0; HC_WARN=0; HC_FAIL=0
 
-    local default_reg="" reg
-    if [[ -f /etc/docker/daemon.json ]]; then
-        default_reg=$(python3 -c 'import json; r=json.load(open("/etc/docker/daemon.json")).get("insecure-registries",[]); print(r[0] if r else "")' 2>/dev/null)
-    fi
-    if [[ -n "$default_reg" ]]; then
-        read -rp "Registry host[:port] to test [$default_reg] (type 'none' to skip): " reg
-        reg=${reg:-$default_reg}
-    else
-        read -rp "Registry host[:port] to test (blank to skip): " reg
-    fi
+    local reg
+    read -rp "Registry host[:port] to test [$DEFAULT_REGISTRY] (type 'none' to skip): " reg
+    reg=${reg:-$DEFAULT_REGISTRY}
     [[ "$reg" == "none" ]] && reg=""
 
     hc_check_system
