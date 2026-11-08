@@ -21,6 +21,10 @@ Docker status, SSH keys) then shows a menu:
 10. Deploy a Woodpecker CI agent container — asks for environment
     (Development/Test/Production) and folds it into the agent hostname
     (e.g. `dev-`, `test-`, `prd-` prefix)
+11. CI/CD health check — system (disk, memory, OOM, clock sync, gateway, DNS),
+    Docker daemon, registry reachability (catches "server gave HTTP response to
+    HTTPS client" and x509 errors, optional login test) and Woodpecker agent
+    (state, restarts, server reachability, packet loss, disconnect/auth log patterns)
 
 Must be run as root (`sudo`). Netplan edits are backed up before being changed.
 

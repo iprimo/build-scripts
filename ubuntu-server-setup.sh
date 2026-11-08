@@ -859,6 +859,312 @@ deploy_woodpecker_agent() {
 # Main menu
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 11) CI/CD health check
+# ---------------------------------------------------------------------------
+
+HC_PASS=0; HC_WARN=0; HC_FAIL=0
+
+hc_pass() { echo -e "  ${GREEN}[PASS]${NC} $*"; HC_PASS=$((HC_PASS + 1)); }
+hc_warn() { echo -e "  ${YELLOW}[WARN]${NC} $*"; HC_WARN=$((HC_WARN + 1)); }
+hc_fail() { echo -e "  ${RED}[FAIL]${NC} $*"; HC_FAIL=$((HC_FAIL + 1)); }
+hc_info() { echo -e "         $*"; }
+hc_section() { echo; echo -e "${BLUE}== $* ==${NC}"; }
+
+# hc_tcp host port -> 0 if a TCP connection opens within 5s
+hc_tcp() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+hc_check_system() {
+    hc_section "System"
+
+    local pct
+    for mp in / /var/lib/docker; do
+        [[ -d "$mp" ]] || continue
+        pct=$(df -P "$mp" | awk 'NR==2{gsub("%","",$5); print $5}')
+        if   (( pct >= 90 )); then hc_fail "Disk $mp is ${pct}% full (builds will fail with 'no space left')"
+        elif (( pct >= 80 )); then hc_warn "Disk $mp is ${pct}% full"
+        else hc_pass "Disk $mp is ${pct}% full"; fi
+        pct=$(df -Pi "$mp" | awk 'NR==2{gsub("%","",$5); print $5}')
+        if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then hc_fail "Inodes on $mp are ${pct}% used"; fi
+    done
+
+    local mem_avail mem_total swap_total
+    mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    mem_avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    swap_total=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+    pct=$(( 100 * mem_avail / mem_total ))
+    if   (( pct < 10 )); then hc_fail "Only ${pct}% memory available ($((mem_avail / 1024)) MB) - OOM kills likely"
+    elif (( pct < 20 )); then hc_warn "Only ${pct}% memory available ($((mem_avail / 1024)) MB)"
+    else hc_pass "Memory available: ${pct}% ($((mem_avail / 1024)) MB)"; fi
+    (( swap_total == 0 )) && hc_info "No swap configured (OOM killer acts sooner under load)"
+
+    local load cpus
+    load=$(awk '{print $1}' /proc/loadavg)
+    cpus=$(nproc)
+    if awk -v l="$load" -v c="$cpus" 'BEGIN{exit !(l > c * 2)}'; then
+        hc_warn "Load average $load is high for $cpus CPU(s)"
+    else
+        hc_pass "Load average $load ($cpus CPU(s))"
+    fi
+
+    local oom
+    oom=$(journalctl -k --since "-24h" --no-pager 2>/dev/null | grep -ci 'out of memory\|oom-kill')
+    if (( ${oom:-0} > 0 )); then
+        hc_warn "Kernel OOM events in the last 24h: $oom (processes/containers were killed)"
+    else
+        hc_pass "No kernel OOM events in the last 24h"
+    fi
+
+    # Clock skew breaks TLS, registry tokens and agent auth
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+        hc_pass "Clock is NTP-synchronised"
+    else
+        hc_warn "Clock is NOT NTP-synchronised (skew breaks TLS and registry/agent auth). Try: timedatectl set-ntp true"
+    fi
+
+    local gw
+    gw=$(ip -4 route show default | awk '{print $3; exit}')
+    if [[ -z "$gw" ]]; then
+        hc_fail "No default gateway"
+    elif ping -c2 -W2 "$gw" &>/dev/null; then
+        hc_pass "Default gateway $gw reachable"
+    else
+        hc_fail "Default gateway $gw not reachable"
+    fi
+
+    if getent hosts example.com &>/dev/null; then
+        hc_pass "DNS resolution works"
+    else
+        hc_fail "DNS resolution failed (check option 2)"
+    fi
+}
+
+hc_check_docker() {
+    hc_section "Docker"
+
+    if ! command -v docker &>/dev/null; then
+        hc_fail "Docker is not installed (option 5)"
+        return 1
+    fi
+    if ! systemctl is-active --quiet docker; then
+        hc_fail "Docker service is not running (systemctl status docker)"
+        return 1
+    fi
+    if ! docker info &>/dev/null; then
+        hc_fail "Docker daemon is not responding to 'docker info'"
+        return 1
+    fi
+    hc_pass "Docker daemon running ($(docker --version | cut -d, -f1))"
+
+    if docker compose version &>/dev/null; then
+        hc_pass "Compose plugin present ($(docker compose version --short))"
+    else
+        hc_warn "Docker Compose plugin missing"
+    fi
+
+    if [[ -f /etc/docker/daemon.json ]]; then
+        if python3 -c 'import json,sys; json.load(open("/etc/docker/daemon.json"))' 2>/dev/null; then
+            hc_pass "/etc/docker/daemon.json is valid JSON"
+        else
+            hc_fail "/etc/docker/daemon.json is NOT valid JSON (daemon will not start after a restart)"
+        fi
+    fi
+
+    local sockperm
+    sockperm=$(stat -c '%a' /var/run/docker.sock 2>/dev/null)
+    hc_info "docker.sock mode: ${sockperm:-?}"
+
+    local reclaim
+    reclaim=$(docker system df --format '{{.Type}}: {{.Reclaimable}}' 2>/dev/null | tr '\n' ';')
+    hc_info "Reclaimable space -> ${reclaim:-n/a}  (clean with: docker system prune -af)"
+
+    local dead
+    dead=$(docker ps -a --filter status=restarting --format '{{.Names}}' | tr '\n' ' ')
+    if [[ -n "$dead" ]]; then hc_warn "Containers stuck restarting: $dead"; else hc_pass "No containers stuck restarting"; fi
+    return 0
+}
+
+# hc_check_registry host[:port] [user]
+hc_check_registry() {
+    local reg=$1 host port c_https c_http
+    hc_section "Registry: $reg"
+    host=${reg%%:*}
+    port=${reg##*:}
+    [[ "$port" == "$reg" ]] && port=443
+
+    if ! getent hosts "$host" &>/dev/null && [[ ! "$host" =~ ^[0-9.]+$ ]]; then
+        hc_fail "Cannot resolve $host"
+        return
+    fi
+    if ! hc_tcp "$host" "$port"; then
+        hc_fail "TCP connect to $host:$port failed (firewall / registry down)"
+        return
+    fi
+    hc_pass "TCP connect to $host:$port"
+
+    c_https=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "https://${reg}/v2/" 2>/dev/null)
+    c_http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://${reg}/v2/" 2>/dev/null)
+
+    local insecure_active=0
+    if docker info 2>/dev/null | sed -n '/Insecure Registries:/,/^ [A-Za-z]/p' | grep -qF "$reg"; then
+        insecure_active=1
+    fi
+    local insecure_cfg=0
+    grep -qF "\"$reg\"" /etc/docker/daemon.json 2>/dev/null && insecure_cfg=1
+
+    if [[ "$c_https" == "200" || "$c_https" == "401" ]]; then
+        hc_pass "Registry answers HTTPS /v2/ (HTTP $c_https)"
+        if ! curl -s -o /dev/null --max-time 8 "https://${reg}/v2/" 2>/dev/null; then
+            if (( insecure_active )); then
+                hc_pass "Certificate not trusted, but registry is in the active insecure-registries list"
+            else
+                hc_fail "Certificate not trusted -> 'x509: certificate signed by unknown authority'. Install the CA in /etc/docker/certs.d/${reg}/ca.crt or use option 9"
+            fi
+        else
+            hc_pass "TLS certificate is trusted"
+        fi
+    elif [[ "$c_http" == "200" || "$c_http" == "401" ]]; then
+        hc_warn "Registry only speaks plain HTTP (HTTP $c_http)"
+        if (( insecure_active )); then
+            hc_pass "Docker daemon has $reg in its ACTIVE insecure-registries list"
+        elif (( insecure_cfg )); then
+            hc_fail "$reg is in daemon.json but Docker was not restarted - run: systemctl restart docker"
+        else
+            hc_fail "Reproduces 'server gave HTTP response to HTTPS client': add $reg via option 9 on THIS host"
+        fi
+    else
+        hc_fail "No usable /v2/ endpoint (HTTPS: ${c_https:-none}, HTTP: ${c_http:-none})"
+        return
+    fi
+
+    # Optional real login test
+    local user pass
+    read -rp "  Registry username for a login test (blank to skip): " user
+    if [[ -n "$user" ]]; then
+        read -rsp "  Password: " pass; echo
+        if echo "$pass" | docker login "$reg" -u "$user" --password-stdin >/tmp/hc-login.out 2>&1; then
+            hc_pass "docker login to $reg succeeded"
+            docker logout "$reg" &>/dev/null
+        else
+            hc_fail "docker login failed: $(tr '\n' ' ' </tmp/hc-login.out | cut -c1-200)"
+        fi
+        rm -f /tmp/hc-login.out
+    fi
+}
+
+hc_check_woodpecker() {
+    hc_section "Woodpecker agent"
+
+    if ! command -v docker &>/dev/null; then hc_warn "Docker missing, skipping"; return; fi
+
+    local agents name
+    agents=$(docker ps -a --format '{{.Names}} {{.Image}}' | awk '/woodpecker-agent/{print $1}')
+    if [[ -z "$agents" ]]; then
+        hc_warn "No Woodpecker agent container found on this host (option 10)"
+        return
+    fi
+
+    for name in $agents; do
+        echo -e "  ${BLUE}-- container: $name${NC}"
+        local state restarts oom started policy server envs
+        state=$(docker inspect -f '{{.State.Status}}' "$name")
+        restarts=$(docker inspect -f '{{.RestartCount}}' "$name")
+        oom=$(docker inspect -f '{{.State.OOMKilled}}' "$name")
+        started=$(docker inspect -f '{{.State.StartedAt}}' "$name")
+        policy=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name")
+        envs=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name")
+        server=$(echo "$envs" | sed -n 's/^WOODPECKER_SERVER=//p')
+
+        if [[ "$state" == "running" ]]; then hc_pass "Running since $started"; else hc_fail "State is '$state'"; fi
+        [[ "$policy" == "always" || "$policy" == "unless-stopped" ]] \
+            && hc_pass "Restart policy: $policy" || hc_warn "Restart policy is '$policy' (agent will not come back after reboot)"
+        if (( restarts > 3 )); then hc_warn "Container restarted $restarts times (crash-looping?)"; else hc_pass "Restart count: $restarts"; fi
+        [[ "$oom" == "true" ]] && hc_fail "Container was OOM-killed"
+
+        docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$name" | grep -q '/var/run/docker.sock' \
+            && hc_pass "docker.sock mounted" || hc_fail "docker.sock is not mounted (agent cannot run pipelines)"
+        echo "$envs" | grep -q '^WOODPECKER_AGENT_SECRET=.\+' \
+            && hc_pass "Agent secret is set" || hc_fail "Agent secret is empty"
+        hc_info "Hostname: $(docker inspect -f '{{.Config.Hostname}}' "$name")  Server: ${server:-?}"
+
+        if [[ -n "$server" ]]; then
+            local shost sport
+            shost=${server%%:*}; sport=${server##*:}
+            [[ "$sport" == "$server" ]] && sport=9000
+            if hc_tcp "$shost" "$sport"; then
+                hc_pass "Server $shost:$sport reachable from host"
+            else
+                hc_fail "Server $shost:$sport NOT reachable (gRPC port blocked or server down) - top cause of disconnects"
+            fi
+
+            # Connection quality: flaky links cause stream drops
+            local ping_out loss rtt
+            ping_out=$(ping -c 20 -i 0.2 -W 2 "$shost" 2>/dev/null)
+            if [[ -n "$ping_out" ]]; then
+                loss=$(echo "$ping_out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
+                rtt=$(echo "$ping_out" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p')
+                if awk -v l="${loss:-0}" 'BEGIN{exit !(l > 0)}'; then
+                    hc_warn "Packet loss to server: ${loss}% (avg RTT ${rtt:-?} ms) - causes agent disconnects"
+                else
+                    hc_pass "No packet loss to server (avg RTT ${rtt:-?} ms)"
+                fi
+            else
+                hc_info "Server does not answer ICMP; skipped loss test"
+            fi
+        fi
+
+        # Look for disconnect patterns in recent logs
+        local logs n_disc n_auth n_err
+        logs=$(docker logs --since 24h "$name" 2>&1)
+        n_disc=$(echo "$logs" | grep -ciE 'unavailable|connection (reset|refused|closed)|transport is closing|EOF|deadline exceeded|reconnect|disconnect')
+        n_auth=$(echo "$logs" | grep -ciE 'unauthenticated|auth.*(fail|invalid)|permission denied|invalid token|secret')
+        n_err=$(echo "$logs" | grep -ciE '\berror\b|level=error|"level":"error"')
+        if (( n_disc > 0 )); then hc_warn "$n_disc disconnect-style log lines in last 24h"; else hc_pass "No disconnect messages in last 24h"; fi
+        (( n_auth > 0 )) && hc_fail "$n_auth auth-related log lines (agent secret mismatch with server?)"
+        hc_info "Error lines in last 24h: $n_err"
+        if (( n_disc + n_auth > 0 )); then
+            hc_info "Last relevant log lines:"
+            echo "$logs" | grep -iE 'unavailable|reset|refused|closing|EOF|deadline|reconnect|disconnect|unauthenticated|auth|denied' \
+                | tail -n 5 | cut -c1-180 | sed 's/^/           /'
+        fi
+    done
+}
+
+health_check() {
+    clear
+    echo -e "${YELLOW}--- CI/CD health check ---${NC}"
+    HC_PASS=0; HC_WARN=0; HC_FAIL=0
+
+    local default_reg="" reg
+    if [[ -f /etc/docker/daemon.json ]]; then
+        default_reg=$(python3 -c 'import json; r=json.load(open("/etc/docker/daemon.json")).get("insecure-registries",[]); print(r[0] if r else "")' 2>/dev/null)
+    fi
+    if [[ -n "$default_reg" ]]; then
+        read -rp "Registry host[:port] to test [$default_reg] (type 'none' to skip): " reg
+        reg=${reg:-$default_reg}
+    else
+        read -rp "Registry host[:port] to test (blank to skip): " reg
+    fi
+    [[ "$reg" == "none" ]] && reg=""
+
+    hc_check_system
+    if hc_check_docker; then
+        [[ -n "$reg" ]] && hc_check_registry "$reg"
+        hc_check_woodpecker
+    fi
+
+    echo
+    echo -e "${BLUE}=============================================================${NC}"
+    echo -e "  Summary: ${GREEN}${HC_PASS} passed${NC}, ${YELLOW}${HC_WARN} warnings${NC}, ${RED}${HC_FAIL} failed${NC}"
+    if (( HC_FAIL > 0 )); then
+        echo -e "  ${RED}Fix the FAIL items above before relying on CI/CD builds on this host.${NC}"
+    fi
+    echo "  Note: with the docker.sock mount, 'docker login/push' in pipelines uses THIS"
+    echo "  host's daemon, so insecure-registries must be configured here (option 9)."
+    echo -e "${BLUE}=============================================================${NC}"
+    press_enter
+}
+
 main_menu() {
     while true; do
         show_config
@@ -874,6 +1180,7 @@ main_menu() {
         echo "  8) Print SSH public key(s) to screen"
         echo "  9) Setup insecure Docker registries"
         echo " 10) Deploy Woodpecker CI agent"
+        echo " 11) CI/CD health check (system, Docker, registry, Woodpecker agent)"
         echo "  0) Exit"
         echo
         read -rp "Choice: " choice
@@ -888,6 +1195,7 @@ main_menu() {
             8) print_ssh_keys ;;
             9) setup_insecure_registries ;;
             10) deploy_woodpecker_agent ;;
+            11) health_check ;;
             0) echo "Bye."; exit 0 ;;
             *) echo -e "${RED}Invalid choice.${NC}"; sleep 1 ;;
         esac
