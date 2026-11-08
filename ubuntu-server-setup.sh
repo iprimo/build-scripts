@@ -1028,7 +1028,23 @@ hc_check_registry() {
         if (( insecure_active )); then
             hc_pass "Docker daemon has $reg in its ACTIVE insecure-registries list"
         elif (( insecure_cfg )); then
-            hc_fail "$reg is in daemon.json but Docker was not restarted - run: systemctl restart docker"
+            hc_fail "$reg is in daemon.json but Docker was not restarted, so the daemon still uses HTTPS for it"
+            echo -e "         ${YELLOW}Restarting Docker stops running containers (the Woodpecker agent restarts itself;${NC}"
+            echo -e "         ${YELLOW}any running pipeline on this host will be interrupted).${NC}"
+            read -rp "         Restart Docker now to apply it? [y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                systemctl restart docker
+                local i
+                for i in 1 2 3 4 5 6 7 8 9 10; do docker info &>/dev/null && break; sleep 1; done
+                if docker info 2>/dev/null | sed -n '/Insecure Registries:/,/^ [A-Za-z]/p' | grep -qF "$reg"; then
+                    insecure_active=1
+                    hc_pass "Docker restarted; $reg is now in the active insecure-registries list"
+                else
+                    hc_fail "Docker restarted but $reg is still not active - check /etc/docker/daemon.json"
+                fi
+            else
+                hc_info "Skipped. Run later: systemctl restart docker"
+            fi
         else
             hc_fail "Reproduces 'server gave HTTP response to HTTPS client': add $reg via option 9 on THIS host"
         fi
